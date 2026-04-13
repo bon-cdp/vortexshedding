@@ -399,19 +399,6 @@ inline VortexWarning assess_risk(
     // Calculate stress ratio
     warning.stress_ratio = max_stress_MPa / yield_strength_MPa;
 
-    // Cap: if V_critical is beyond the 99.99th percentile of the local wind
-    // climate, the mode is practically unreachable - skip the risk decision
-    // tree to avoid false-positive flags on high secondary modes whose
-    // critical wind speeds the local climate will never produce.
-    if (warning.wind_percentile >= 99.99) {
-        warning.level      = SAFE;
-        warning.level_name = "UNREACHABLE";
-        warning.message    = "V_critical beyond 99.99th percentile of local wind";
-        warning.recommendations.push_back(
-            "Mode is not excited by realistic wind speeds at this location - no action required");
-        return warning;
-    }
-
     // Calculate slenderness
     double slenderness = L_m / (D_mm / 1000.0);
 
@@ -473,6 +460,22 @@ inline VortexWarning assess_risk(
         warning.message = "Vibration risk within acceptable limits";
         warning.recommendations.push_back("No immediate action required");
         warning.recommendations.push_back("Include in routine structural inspection schedule");
+    }
+
+    // Post-decision-tree cap: if V_critical is far beyond the realistic
+    // upper tail of the local wind (> 125% of the 99.99th percentile),
+    // the computed forces and stresses are hypothetical — the wind climate
+    // will not produce this speed.  Downgrade to UNREACHABLE regardless of
+    // stress level, because the stress is a theoretical value from a wind
+    // speed the location never produces.
+    double v_ceiling = climate_percentile(location, 0.9999) * 1.25;
+    if (V_critical_ms > v_ceiling) {
+        warning.level      = SAFE;
+        warning.level_name = "UNREACHABLE";
+        warning.message    = "V_critical beyond local wind climate ceiling";
+        warning.recommendations.clear();
+        warning.recommendations.push_back(
+            "Mode is not excited by realistic wind speeds at this location");
     }
 
     return warning;

@@ -45,20 +45,42 @@
 
 enum class ColorVariable { UDL, MOMENT, STRESS };
 
+// Smooth linear interpolation through 5 anchor colors.
+// Returns a continuously-blended COLORREF for any normalized value [0,1].
 static COLORREF value_to_colorref(double normalized) {
-    if (normalized < 0.2) return RGB( 40, 110, 230);   // Blue
-    if (normalized < 0.4) return RGB(  0, 180, 220);   // Cyan
-    if (normalized < 0.6) return RGB( 40, 180,  60);   // Green
-    if (normalized < 0.8) return RGB(240, 190,   0);   // Yellow
-    return                       RGB(220,  40,  40);   // Red
+    struct RGB3 { int r, g, b; };
+    static constexpr RGB3 anchors[] = {
+        { 40, 110, 230},   // 0.00  Blue
+        {  0, 180, 220},   // 0.25  Cyan
+        { 40, 180,  60},   // 0.50  Green
+        {240, 190,   0},   // 0.75  Yellow
+        {220,  40,  40},   // 1.00  Red
+    };
+    constexpr int N = 4;  // number of segments (anchors - 1)
+
+    if (normalized <= 0.0) return RGB(anchors[0].r, anchors[0].g, anchors[0].b);
+    if (normalized >= 1.0) return RGB(anchors[N].r, anchors[N].g, anchors[N].b);
+
+    double scaled = normalized * N;          // 0..4
+    int    seg    = (int)scaled;             // segment index 0..3
+    double t      = scaled - seg;            // fraction within segment
+    if (seg >= N) { seg = N - 1; t = 1.0; }
+
+    const RGB3& a = anchors[seg];
+    const RGB3& b = anchors[seg + 1];
+    int r = a.r + (int)((b.r - a.r) * t);
+    int g = a.g + (int)((b.g - a.g) * t);
+    int bl= a.b + (int)((b.b - a.b) * t);
+    return RGB(r, g, bl);
 }
 
+// Band index for the pre-created pen cache in draw_mode_shapes.
+// 16 bands so each pen covers a narrow slice of the gradient.
 static int color_band(double normalized) {
-    if (normalized < 0.2) return 0;
-    if (normalized < 0.4) return 1;
-    if (normalized < 0.6) return 2;
-    if (normalized < 0.8) return 3;
-    return 4;
+    int band = (int)(normalized * 16);
+    if (band < 0)  band = 0;
+    if (band > 15) band = 15;
+    return band;
 }
 
 static double get_value_at_position(const ModeResult& mode, double x_norm, ColorVariable var) {
@@ -171,6 +193,7 @@ static HWND g_hLocationCombo = nullptr;
 static HWND g_hDEdit = nullptr, g_hTEdit = nullptr, g_hLEdit = nullptr;
 static HWND g_hDampEdit = nullptr, g_hAxialEdit = nullptr;
 static HWND g_hVminEdit = nullptr, g_hVmaxEdit = nullptr;
+static HWND g_hCustomEEdit = nullptr, g_hCustomRhoEdit = nullptr;
 static HWND g_hUDLRadio = nullptr, g_hMomentRadio = nullptr, g_hStressRadio = nullptr;
 static HWND g_hUncertaintyCheck = nullptr;
 static HWND g_hSaveButton = nullptr, g_hQuitButton = nullptr;
@@ -204,7 +227,7 @@ static constexpr int MARGIN   = 10;
 static constexpr int LABEL_W  =  95;
 static constexpr int EDIT_W   = 110;
 static constexpr int ROW_H    =  26;
-static constexpr int INPUTS_H = 175;
+static constexpr int INPUTS_H = 200;
 
 // Control IDs
 enum {
@@ -217,6 +240,8 @@ enum {
     ID_LOCATION = 1007,
     ID_VMINEDIT = 1008,
     ID_VMAXEDIT = 1009,
+    ID_CUSTOM_E = 1010,
+    ID_CUSTOM_RHO = 1011,
     ID_RADIO_UDL    = 2001,
     ID_RADIO_MOMENT = 2002,
     ID_RADIO_STRESS = 2003,
@@ -440,10 +465,11 @@ static void draw_mode_shapes(HDC hdc, RECT r) {
     if (g_state.results.empty()) return;
 
     // Pre-create one pen per color band (avoid creating GDI objects in inner loop)
-    HPEN band_pens[5];
-    for (int i = 0; i < 5; i++) {
+    constexpr int N_PENS = 16;
+    HPEN band_pens[N_PENS];
+    for (int i = 0; i < N_PENS; i++) {
         band_pens[i] = CreatePen(PS_SOLID, 2,
-            value_to_colorref(0.1 + 0.2 * i));
+            value_to_colorref(((double)i + 0.5) / N_PENS));
     }
 
     // Global max for color normalization (across all BCs and modes)
@@ -582,7 +608,7 @@ static void draw_mode_shapes(HDC hdc, RECT r) {
         }
     }
 
-    for (int i = 0; i < 5; i++) DeleteObject(band_pens[i]);
+    for (int i = 0; i < N_PENS; i++) DeleteObject(band_pens[i]);
 }
 
 // ============================================================================
@@ -611,25 +637,27 @@ static void draw_color_legend(HDC hdc, RECT r) {
     }
 
     SetBkMode(hdc, TRANSPARENT);
+
+    // ----- Row 1: header with variable name and global max -----
     SelectObject(hdc, g_hFont);
     SetTextColor(hdc, RGB(40, 40, 40));
-
     char hdr[256];
     std::snprintf(hdr, sizeof(hdr),
-        "Showing: %s (%s)     |     MAX = %.3f %s",
+        "Showing: %s (%s)     |     Global MAX = %.2f %s",
         var_name, units, max_val, units);
     std::wstring h = to_wide(hdr);
     RECT hr = r;
-    hr.top    += 6;
+    hr.top    += 4;
     hr.bottom  = hr.top + 16;
     DrawTextW(hdc, h.c_str(), -1, &hr, DT_CENTER | DT_SINGLELINE);
 
-    // Gradient bar
-    int bar_y = r.top + 26;
+    // ----- Row 2: gradient bar with tick marks at color boundaries -----
+    int bar_y = r.top + 22;
     int bar_h = 14;
-    int bar_x = r.left + 60;
-    int bar_w = (r.right - r.left) - 120;
+    int bar_x = r.left + 50;
+    int bar_w = (r.right - r.left) - 100;
 
+    // Draw the gradient
     int n_steps = 60;
     for (int i = 0; i < n_steps; i++) {
         double norm = (double)i / (n_steps - 1);
@@ -645,13 +673,36 @@ static void draw_color_legend(HDC hdc, RECT r) {
     RECT bar_rect = { bar_x, bar_y, bar_x + bar_w, bar_y + bar_h };
     FrameRect(hdc, &bar_rect, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
-    SetTextColor(hdc, RGB( 40,  90, 200));
-    TextOutW(hdc, bar_x - 30, bar_y, L"0", 1);
-    SetTextColor(hdc, RGB(200,  50,  50));
-    char maxstr[64];
-    std::snprintf(maxstr, sizeof(maxstr), "%.2f", max_val);
-    std::wstring ms = to_wide(maxstr);
-    TextOutW(hdc, bar_x + bar_w + 8, bar_y, ms.c_str(), (int)ms.size());
+    // Tick marks and labels at 0%, 20%, 40%, 60%, 80%, 100% of max
+    SelectObject(hdc, g_hFontSmall);
+    HPEN tick_pen = CreatePen(PS_SOLID, 1, RGB(60, 60, 60));
+    HGDIOBJ old_pen = SelectObject(hdc, tick_pen);
+
+    constexpr int N_TICKS = 16;
+    for (int ti = 0; ti <= N_TICKS; ti++) {
+        double tn = (double)ti / N_TICKS;
+        int tx = bar_x + (int)(tn * bar_w);
+        // Tick line below the bar
+        MoveToEx(hdc, tx, bar_y + bar_h, nullptr);
+        LineTo  (hdc, tx, bar_y + bar_h + 5);
+        // Value label
+        double val = tn * max_val;
+        char tick_buf[32];
+        if (max_val >= 100.0)
+            std::snprintf(tick_buf, sizeof(tick_buf), "%.0f", val);
+        else if (max_val >= 1.0)
+            std::snprintf(tick_buf, sizeof(tick_buf), "%.1f", val);
+        else
+            std::snprintf(tick_buf, sizeof(tick_buf), "%.3f", val);
+        std::wstring tw = to_wide(tick_buf);
+        SetTextColor(hdc, value_to_colorref(tn));
+        int text_w = (int)tw.size() * 6;  // rough char width
+        TextOutW(hdc, tx - text_w / 2, bar_y + bar_h + 6, tw.c_str(), (int)tw.size());
+    }
+
+    SelectObject(hdc, old_pen);
+    DeleteObject(tick_pen);
+
 }
 
 // ============================================================================
@@ -814,61 +865,79 @@ static void draw_wind_distribution(HDC hdc, RECT r) {
 // CUSTOM DRAWING — warning banner
 // ============================================================================
 
+// Color for a given warning level (background + text).
+static void warning_level_colors(WindData::WarningLevel lvl,
+                                 COLORREF& bg_out, COLORREF& fg_out) {
+    switch (lvl) {
+        case WindData::CRITICAL:  bg_out = RGB(200,  30,  30); fg_out = RGB(255,255,255); break;
+        case WindData::HIGH_RISK: bg_out = RGB(230, 100,  30); fg_out = RGB(255,255,255); break;
+        case WindData::WARNING:   bg_out = RGB(240, 200,  30); fg_out = RGB( 40, 40, 40); break;
+        case WindData::CAUTION:   bg_out = RGB(100, 180, 220); fg_out = RGB(255,255,255); break;
+        default:                  bg_out = RGB(120, 200, 100); fg_out = RGB(255,255,255); break;
+    }
+}
+
 static void draw_warning_banner(HDC hdc, RECT r) {
-    if (g_state.warnings.empty()) {
-        HBRUSH bg = CreateSolidBrush(RGB(240, 240, 240));
-        FillRect(hdc, &r, bg);
-        DeleteObject(bg);
-        return;
-    }
-
-    WindData::WarningLevel worst = WindData::SAFE;
-    size_t worst_idx = 0;
-    for (size_t i = 0; i < g_state.warnings.size(); i++) {
-        if (g_state.warnings[i].level > worst) {
-            worst = g_state.warnings[i].level;
-            worst_idx = i;
-        }
-    }
-
-    COLORREF bg_color, text_color;
-    switch (worst) {
-        case WindData::CRITICAL:  bg_color = RGB(200,  30,  30); text_color = RGB(255, 255, 255); break;
-        case WindData::HIGH_RISK: bg_color = RGB(230, 100,  30); text_color = RGB(255, 255, 255); break;
-        case WindData::WARNING:   bg_color = RGB(240, 200,  30); text_color = RGB( 40,  40,  40); break;
-        case WindData::CAUTION:   bg_color = RGB(100, 180, 220); text_color = RGB(255, 255, 255); break;
-        default:                  bg_color = RGB(120, 200, 100); text_color = RGB(255, 255, 255); break;
-    }
-
-    HBRUSH bg = CreateSolidBrush(bg_color);
+    // Background
+    HBRUSH bg = CreateSolidBrush(RGB(248, 248, 248));
     FillRect(hdc, &r, bg);
     DeleteObject(bg);
-    FrameRect(hdc, &r, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    FrameRect(hdc, &r, (HBRUSH)GetStockObject(GRAY_BRUSH));
+
+    if (g_state.warnings.empty()) return;
 
     SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, text_color);
-    SelectObject(hdc, g_hFontBold);
+    SelectObject(hdc, g_hFontSmall);
 
-    const auto& w = g_state.warnings[worst_idx];
-    char msg[512];
-    if (worst == WindData::SAFE) {
-        std::snprintf(msg, sizeof(msg),
-            "  [%s]  All boundary conditions within acceptable limits.",
-            w.level_name.c_str());
-    } else {
-        std::snprintf(msg, sizeof(msg),
-            "  [%s]  %s   |   Worst BC: %s   "
-            "(V_crit at %.0fth pct of wind, stress %.0f%% of yield)",
-            w.level_name.c_str(),
-            w.message.c_str(),
-            g_state.results[worst_idx].bc_name.c_str(),
+    int row_h = 15;
+    int y = r.top + 4;
+    int x = r.left + 6;
+    int avail_w = r.right - r.left - 12;
+
+    // One line per BC
+    for (size_t i = 0; i < g_state.warnings.size() && i < g_state.results.size(); i++) {
+        if (y + row_h > r.bottom) break;   // clip if panel too small
+
+        const auto& w   = g_state.warnings[i];
+        const auto& bc  = g_state.results[i];
+
+        // Shorten BC name
+        std::string bc_short = bc.bc_name;
+        if (bc_short.find("Fixed-Fixed") != std::string::npos)       bc_short = "Fix-Fix";
+        else if (bc_short.find("Fixed-Hinged") != std::string::npos) bc_short = "Fix-Hng";
+        else if (bc_short.find("Hinged-Hinged") != std::string::npos)bc_short = "Hng-Hng";
+        else if (bc_short.find("Fixed-Free") != std::string::npos)   bc_short = "Cantilev";
+        else if (bc_short.find("Hinged-Free") != std::string::npos)  bc_short = "Hng-Free";
+        else if (bc_short.find("Free-Free") != std::string::npos)    bc_short = "Free-Free";
+
+        // Small colored tag for the level
+        COLORREF tag_bg, tag_fg;
+        warning_level_colors(w.level, tag_bg, tag_fg);
+
+        int tag_w = 80;
+        RECT tag_r = { x, y, x + tag_w, y + row_h };
+        HBRUSH tb = CreateSolidBrush(tag_bg);
+        FillRect(hdc, &tag_r, tb);
+        DeleteObject(tb);
+
+        SetTextColor(hdc, tag_fg);
+        std::wstring lvl_w = to_wide(w.level_name);
+        DrawTextW(hdc, lvl_w.c_str(), -1, &tag_r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        // BC name + details
+        SetTextColor(hdc, RGB(40, 40, 40));
+        char line[256];
+        std::snprintf(line, sizeof(line),
+            "  %-10s  V=%.2f m/s  wind=%.1f%%  stress=%.1f%% yield",
+            bc_short.c_str(),
+            bc.modes.empty() ? 0.0 : bc.modes[0].V_critical_ms,
             w.wind_percentile,
             w.stress_ratio * 100.0);
+        std::wstring lw = to_wide(line);
+        TextOutW(hdc, x + tag_w + 4, y, lw.c_str(), (int)lw.size());
+
+        y += row_h;
     }
-    std::wstring mw = to_wide(msg);
-    RECT tr = r;
-    tr.left += 8;
-    DrawTextW(hdc, mw.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
 // ============================================================================
@@ -881,11 +950,11 @@ static void LayoutWindow(int width, int height) {
     int modes_vy   = input_bottom_vy + MARGIN;
     int modes_h    = 350;
     int legend_vy  = modes_vy + modes_h + MARGIN;
-    int legend_h   = 50;
+    int legend_h   = 58;
     int wind_vy    = legend_vy + legend_h + MARGIN;
     int wind_h     = 200;
     int warn_vy    = wind_vy + wind_h + MARGIN;
-    int warn_h     = 30;
+    int warn_h     = 100;
     int btn_vy     = warn_vy + warn_h + MARGIN;
     int btn_h      = 28;
     g_content_h    = btn_vy + btn_h + MARGIN;
@@ -1048,13 +1117,21 @@ static void CreateControls(HWND hwnd) {
         col4_x + 100, y + 1*ROW_H, 160, 22, ID_CHK_UNCERT, BS_AUTOCHECKBOX);
     SendMessage(g_hUncertaintyCheck, BM_SETCHECK, BST_CHECKED, 0);
 
-    // ----- Row 4: wind range (full-width row, only used when location = Custom Uniform) -----
+    // ----- Row 4: wind range (only for Custom Uniform location) -----
     int row4_y = y + 4*ROW_H;
     label(L"Wind range (Custom Uniform only):", col1_x, row4_y + 4, 220);
     g_hVminEdit = edit(L"0.0",  col1_x + 230, row4_y, 60, ID_VMINEDIT);
     label(L"to", col1_x + 295, row4_y + 4, 16);
     g_hVmaxEdit = edit(L"25.0", col1_x + 315, row4_y, 60, ID_VMAXEDIT);
     label(L"m/s", col1_x + 380, row4_y + 4, 30);
+
+    // ----- Row 5: custom material E and density (only for Custom material) -----
+    int row5_y = y + 5*ROW_H;
+    label(L"Custom material:", col1_x, row5_y + 4, 110);
+    label(L"E (GPa):", col1_x + 115, row5_y + 4, 55);
+    g_hCustomEEdit   = edit(L"200.0", col1_x + 172, row5_y, 60, ID_CUSTOM_E);
+    label(L"Density (kg/m3):", col1_x + 245, row5_y + 4, 105);
+    g_hCustomRhoEdit = edit(L"7850", col1_x + 355, row5_y, 60, ID_CUSTOM_RHO);
 
     // ----- Bottom row buttons (positioned later by LayoutWindow) -----
     g_hSaveButton = button(L"Print Report...", 0, 0, 150, 28, ID_BTN_SAVE);
@@ -1085,6 +1162,8 @@ static void CreateControls(HWND hwnd) {
     set_edit_double(g_hAxialEdit, g_state.axial_force_kN, 1);
     set_edit_double(g_hVminEdit,  g_state.custom_wind_min, 1);
     set_edit_double(g_hVmaxEdit,  g_state.custom_wind_max, 1);
+    set_edit_double(g_hCustomEEdit,   g_state.custom_E_GPa, 1);
+    set_edit_double(g_hCustomRhoEdit, g_state.custom_rho, 0);
 
     // Apply font to every child (labels, edits, combos, buttons, statics)
     EnumChildWindows(hwnd, [](HWND h, LPARAM lp) -> BOOL {
@@ -1097,12 +1176,17 @@ static void CreateControls(HWND hwnd) {
 // STATE REFRESH (read controls → update state → recalc → invalidate)
 // ============================================================================
 
-// Enable / disable the wind-range edits depending on whether the
-// currently selected location is the uniform-distribution placeholder.
-static void UpdateWindRangeEnabled() {
-    bool en = g_state.current_climate().uniform;
-    if (g_hVminEdit) EnableWindow(g_hVminEdit, en);
-    if (g_hVmaxEdit) EnableWindow(g_hVmaxEdit, en);
+// Enable / disable conditional fields based on current selections.
+static void UpdateConditionalFields() {
+    // Wind range: only active for Custom Uniform location
+    bool wind_en = g_state.current_climate().uniform;
+    if (g_hVminEdit) EnableWindow(g_hVminEdit, wind_en);
+    if (g_hVmaxEdit) EnableWindow(g_hVmaxEdit, wind_en);
+
+    // Custom material E / density: only active when material = "Custom"
+    bool mat_en = (static_cast<size_t>(g_state.material_index) >= MATERIALS.size() - 1);
+    if (g_hCustomEEdit)   EnableWindow(g_hCustomEEdit,   mat_en);
+    if (g_hCustomRhoEdit) EnableWindow(g_hCustomRhoEdit, mat_en);
 }
 
 static void UpdateInfoText() {
@@ -1127,6 +1211,8 @@ static void RefreshState() {
     g_state.axial_force_kN  = parse_double(g_hAxialEdit, g_state.axial_force_kN);
     g_state.custom_wind_min = parse_double(g_hVminEdit,  g_state.custom_wind_min);
     g_state.custom_wind_max = parse_double(g_hVmaxEdit,  g_state.custom_wind_max);
+    g_state.custom_E_GPa   = parse_double(g_hCustomEEdit,   g_state.custom_E_GPa);
+    g_state.custom_rho     = parse_double(g_hCustomRhoEdit,  g_state.custom_rho);
 
     // Sanity clamps so we never crash the physics
     if (g_state.D_mm < 1.0)               g_state.D_mm = 1.0;
@@ -1138,6 +1224,8 @@ static void RefreshState() {
     if (g_state.custom_wind_min < 0.0)    g_state.custom_wind_min = 0.0;
     if (g_state.custom_wind_max <= g_state.custom_wind_min)
         g_state.custom_wind_max = g_state.custom_wind_min + 0.1;
+    if (g_state.custom_E_GPa < 0.1)     g_state.custom_E_GPa = 0.1;
+    if (g_state.custom_rho   < 1.0)     g_state.custom_rho   = 1.0;
 
     g_state.material_index = (int)SendMessage(g_hMaterialCombo, CB_GETCURSEL, 0, 0);
     g_state.location_index = (int)SendMessage(g_hLocationCombo, CB_GETCURSEL, 0, 0);
@@ -1146,7 +1234,7 @@ static void RefreshState() {
 
     g_state.update();
     UpdateInfoText();
-    UpdateWindRangeEnabled();
+    UpdateConditionalFields();
 
     // Repaint custom-drawn regions only
     InvalidateRect(g_hwnd, &g_rectModes,   FALSE);
@@ -1647,7 +1735,7 @@ static bool save_docx_report(const std::string& filename, const PrintOptions& op
             rows.push_back({
                 g_state.results[i].bc_name,
                 w.level_name,
-                fmt(w.wind_percentile, 1) + "%",
+                fmt(w.wind_percentile, 0.999) + "%",
                 fmt(w.stress_ratio * 100.0, 1) + "%",
             });
         }
@@ -1969,7 +2057,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             g_state.update();
             UpdateInfoText();
-            UpdateWindRangeEnabled();
+            UpdateConditionalFields();
             return 0;
         }
 
@@ -2025,7 +2113,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int id   = LOWORD(wp);
             int code = HIWORD(wp);
 
-            if (id >= ID_DEDIT && id <= ID_VMAXEDIT
+            if (id >= ID_DEDIT && id <= ID_CUSTOM_RHO
                 && id != ID_LOCATION
                 && code == EN_CHANGE) {
                 RefreshState();

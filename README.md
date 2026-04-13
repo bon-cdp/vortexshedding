@@ -258,3 +258,34 @@ If it does, run `test_docx.exe` (build with `g++ -std=c++20 -O2 test_docx.cpp -o
 test_docx.exe -lgdi32 -lgdiplus -lcomctl32 -lcomdlg32 -lole32 -lshlwapi -static
 -static-libgcc -static-libstdc++`) to regenerate `test_output.docx` and inspect
 it manually.
+
+
+The build command is in build.bat — just double-click it or run it from a terminal:
+
+  build.bat
+                                                                                                                                                                                                                             Which runs:
+                                                                                                                                                                                                                           
+  g++ -std=c++20 -O2 -mwindows torsor_win.cpp -o torsor.exe ^
+      -lgdi32 -lgdiplus -lcomctl32 -lcomdlg32 -lole32 -lshlwapi ^
+      -static -static-libgcc -static-libstdc++
+
+  Requires MSYS2 MinGW64 (which you already have at C:\msys64\mingw64\bin\g++.exe).
+
+  For the physics tests: build_test.bat or just:
+
+  g++ -std=c++20 -O2 test_vortex.cpp -o test_vortex.exe -static -static-libgcc -static-libstdc++
+  test_vortex.exe
+
+  ---
+  As for where to look — the warning/risk logic lives in two files:
+
+  wind_data.h — the assess_risk() function (starts around line 384). This is the decision tree that takes V_critical, stress, yield strength, and the wind climate, then returns a warning level (SAFE / CAUTION / WARNING 
+  / HIGH_RISK / CRITICAL). The post-decision-tree cap that downgrades to UNREACHABLE is at the bottom of that function. The climate_cdf() and climate_percentile() helpers are around line 48.
+
+  torsor_win.cpp — three spots:
+  - AppState::update() (~line 130) — calls assess_risk for Mode 1 of each BC and stores the warnings
+  - draw_warning_banner() (~line 840) — renders the colored banner from the worst warning
+  - RefreshState() (~line 1120) — reads inputs, calls update(), repaints
+
+  The diagnostic harness I used to dump the actual values is diag3.cpp in the project folder — you can tweak inputs there and rebuild with the same flags as the test suite (just add -lgdi32 -lgdiplus -lcomctl32
+  -lcomdlg32 -lole32 -lshlwapi). It prints every BC's V_critical, wind percentile, stress, and warning level so you can see exactly what assess_risk produces for any configuration.
