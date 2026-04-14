@@ -205,7 +205,7 @@ inline double calculate_critical_wind_speed(double omega, double D_m) {
 
 // Calculate static force approximation from vortex shedding
 // F = C1 / (sqrt(L/D) * (ζ - C2*(ρ*D²)/M)^0.5) * qh * D * L
-// where qh = 0.5 * ρ * V²
+// where qh = 0.5 * ρ * V², actually 0.6 in the excel sheet
 // All inputs in SI base units (m, kg, m/s, kg/m³), output in N (convert to kN)
 inline double calculate_static_force(double V_ms, double D_m, double L_m, double damping, double mu_kg_m, double rho_air_kg_m3 = 1.225) {
     // Constants
@@ -213,13 +213,14 @@ inline double calculate_static_force(double V_ms, double D_m, double L_m, double
     const double C2 = 0.6;
 
     // Air density at sea level: 1.225 kg/m³
-    // Velocity pressure: qh = 0.5 * ρ * V² (Pa = N/m²)
-    double qh = 0.5 * rho_air_kg_m3 * V_ms * V_ms;  // Pa
+    // Velocity pressure: qh = 0.5 * ρ * V² (Pa = N/m²), actually 0.6 * vs^2 in the excel sheet
+    double qh = 0.6 * V_ms * V_ms;  // Pa
 
-    // Denominator calculation - CORRECTED to use total mass M = μ*L
+    // Denominator calculation - CORRECTED to mass per unit length
+    
     double sqrt_L_D = std::sqrt(L_m / D_m);
-    double M_total = mu_kg_m * L_m;  // Total mass (kg)
-    double mass_term = C2 * rho_air_kg_m3 * D_m * D_m / M_total;
+    //double M_total = mu_kg_m * L_m;  // Total mass (kg)
+    double mass_term = C2 * rho_air_kg_m3 * D_m * D_m / mu_kg_m;
     double denom_inner = damping - mass_term;
 
     // Handle case where damping is very low
@@ -278,17 +279,17 @@ inline double calculate_moment_at_x(double x_m, double L_m, double F_kN, const s
     // Use empirically-derived modal shape coefficients from reference data
     double w_kN_m = F_kN / L_m;  // Equivalent UDL
 
-    // Mode-dependent moment coefficient (from M/UDL/L² ratio analysis)
-    // Mode 1: M_max/(w×L²) ≈ 0.125 (gives M/UDL ≈ 26.1 for L=14.45m)
+    // Mode-dependent moment coefficient (from M/UDL/L² ratio analysis) -> instead use vals from the spreadsheet
+    // Mode 1: M_max/(w×L²) ≈ 0.125 (gives M/UDL  26.1 for L=14.45≈m)
     // Mode 2: M_max/(w×L²) ≈ 0.0434 (gives M/UDL ≈ 8.7 for L=14.45m)
     double mode_coeff;
     if (mode == 1) {
         mode_coeff = 0.125;  // 1/8
     } else if (mode == 2) {
-        mode_coeff = 0.0434;  // ≈1/23
+        mode_coeff = 1.0/24.0;  // ≈1/23
     } else {
         // For higher modes, interpolate or use conservative estimate
-        mode_coeff = 0.125 / (mode * mode);  // Decreases with mode²
+        mode_coeff = 1.0/ (8.0 * (2.0 * mode - 1.0));  // Decreases with mode²
     }
 
     // For simplicity, use parabolic distribution with mode-corrected peak
@@ -408,13 +409,13 @@ inline ModeResult analyze_mode(const HSS_Member& member, const BoundaryCondition
 
     // 6. Calculate intermediate values for validation
     const double rho_air = 1.225;  // kg/m³
-    result.qh_Pa = 0.5 * rho_air * result.V_critical_ms * result.V_critical_ms;  // Velocity pressure (Pa)
+    result.qh_Pa = 0.6 *  result.V_critical_ms * result.V_critical_ms;  // Velocity pressure (Pa)
     result.strouhal = (result.omega * D_m) / result.V_critical_ms;  // Strouhal number S = ωD/V
     result.sqrt_L_D = std::sqrt(member.L_m / D_m);  // √(L/D) ratio
 
     double M_total = member.mu_kg_m * member.L_m;  // Total mass (kg)
     const double C2 = 0.6;
-    result.mass_ratio = C2 * rho_air * D_m * D_m / M_total;  // C2ρD²/M
+    result.mass_ratio = C2 * rho_air * D_m * D_m / member.mu_kg_m;  // C2ρD²/M
     result.damping_param = member.damping_ratio - result.mass_ratio;  // ζ - C2ρD²/M
 
     // 7. Calculate moment/stress/UDL distributions for visualization

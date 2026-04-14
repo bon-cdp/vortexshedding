@@ -265,9 +265,7 @@ The build command is in build.bat — just double-click it or run it from a term
   build.bat
                                                                                                                                                                                                                              Which runs:
                                                                                                                                                                                                                            
-  g++ -std=c++20 -O2 -mwindows torsor_win.cpp -o torsor.exe ^
-      -lgdi32 -lgdiplus -lcomctl32 -lcomdlg32 -lole32 -lshlwapi ^
-      -static -static-libgcc -static-libstdc++
+  g++ -std=c++20 -O2 -mwindows torsor_win.cpp -o torsor.exe -lgdi32 -lgdiplus -lcomctl32 -lcomdlg32 -lole32 -lshlwapi -static -static-libgcc -static-libstdc++
 
   Requires MSYS2 MinGW64 (which you already have at C:\msys64\mingw64\bin\g++.exe).
 
