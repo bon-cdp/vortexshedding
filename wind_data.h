@@ -462,13 +462,13 @@ inline VortexWarning assess_risk(
         warning.recommendations.push_back("Include in routine structural inspection schedule");
     }
 
-    // Post-decision-tree cap: if V_critical is far beyond the realistic
-    // upper tail of the local wind (> 125% of the 99.99th percentile),
-    // the computed forces and stresses are hypothetical — the wind climate
-    // will not produce this speed.  Downgrade to UNREACHABLE regardless of
-    // stress level, because the stress is a theoretical value from a wind
-    // speed the location never produces.
-    double v_ceiling = climate_percentile(location, 0.9999) * 1.25;
+    // Post-decision-tree cap: if V_critical exceeds the wind climate's
+    // realistic maximum, forces and stresses are hypothetical.
+    // For uniform distributions the hard cutoff is v_max itself.
+    // For Weibull distributions, allow 25% headroom above the 99.99th pct.
+    double v_ceiling = location.uniform
+        ? location.v_max
+        : climate_percentile(location, 0.9999) * 1.25;
     if (V_critical_ms > v_ceiling) {
         warning.level      = SAFE;
         warning.level_name = "UNREACHABLE";

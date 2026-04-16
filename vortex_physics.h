@@ -22,16 +22,17 @@ struct Material {
     std::string name;
     double E_GPa;              // Young's modulus (GPa) - input unit
     double density_kg_m3;      // Density (kg/m³)
+    double yield_MPa;
 };
 
 // Standard structural steel materials (metric SI units)
 const std::vector<Material> MATERIALS = {
-    {"A36 Steel", 200.0, 7850.0},        // E = 200 GPa, ρ = 7850 kg/m³
-    {"A572-50 Steel", 200.0, 7850.0},
-    {"A500 Grade B HSS", 200.0, 7850.0},
-    {"Stainless 316", 193.0, 8000.0},
-    {"Aluminum 6061", 68.9, 2700.0},
-    {"Custom", 0.0, 0.0}  // User-defined
+    {"A36 Steel", 200.0, 7850.0, 250.0},        // E = 200 GPa, ρ = 7850 kg/m³
+    {"A572-50 Steel", 200.0, 7850.0, 345.0},
+    {"A500 Grade B HSS", 200.0, 7850.0, 290.0},
+    {"Stainless 316", 193.0, 8000.0, 205.0},
+    {"Aluminum 6061", 68.9, 2700.0, 276.0},
+    {"Custom", 0.0, 0.0, 345.0}  // User-defined
 };
 
 // ============================================================================
@@ -242,12 +243,14 @@ inline double calculate_static_force(double V_ms, double D_m, double L_m, double
 // α = F*L²/(E*I*π²)
 // All inputs in SI base units
 inline double calculate_axial_frequency(double omega, double F_N, double L_m, double E_Pa, double I_m4, int mode) {
-    double alpha_squared = (F_N * L_m * L_m) / (E_Pa * I_m4 * PI * PI);
+    double alpha = (F_N * L_m * L_m) / (E_Pa * I_m4 * PI * PI);//this just shows as alpha not alpha squared
     double mode_squared = mode * mode;
 
     // Use + for tension, - for compression
     // For vortex shedding, typically assume tension from wind drag
-    double factor = 1.0 + alpha_squared / mode_squared;
+    if (F_N < 0) mode_squared = mode_squared * -1;
+
+    double factor = 1.0 + alpha * alpha / mode_squared;
 
     if (factor < 0) factor = 0;  // Can't have imaginary frequency
 

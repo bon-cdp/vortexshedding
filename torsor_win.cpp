@@ -120,35 +120,42 @@ struct AppState {
     double axial_force_kN =   0.0;
     double custom_E_GPa   = 200.0;
     double custom_rho     = 7850.0;
-    int    location_index = 14;          // "Moderate Wind (Generic)"
+    double custom_yield_MPa = 345;
     ColorVariable active_color_var = ColorVariable::STRESS;
     bool   show_uncertainty = true;
 
-    // Custom uniform wind distribution parameters (used only when the
-    // selected location entry has uniform == true).
-    double custom_wind_min = 0.0;
-    double custom_wind_max = 25.0;
+    // User-adjustable uniform wind speed range
+    double wind_min = 0.0;
+    double wind_max = 20.0;
 
     HSS_Member member{};
     std::vector<VortexResults>            results;
     std::vector<WindData::VortexWarning>  warnings;
 
-    // Returns the active wind climate, with custom min/max applied if the
-    // selected entry is the uniform-distribution placeholder.
+    // Uniform wind climate built from user's min/max.
     WindData::WindClimate current_climate() const {
-        WindData::WindClimate c = WindData::PORT_CLIMATES[location_index];
-        if (c.uniform) {
-            c.v_min = custom_wind_min;
-            c.v_max = custom_wind_max;
-            if (c.v_max <= c.v_min) c.v_max = c.v_min + 0.1;
-            double range = c.v_max - c.v_min;
-            c.mean_speed_ms = (c.v_min + c.v_max) / 2.0;
-            c.percentile_50 = c.v_min + 0.50 * range;
-            c.percentile_75 = c.v_min + 0.75 * range;
-            c.percentile_90 = c.v_min + 0.90 * range;
-            c.percentile_95 = c.v_min + 0.95 * range;
-            c.percentile_99 = c.v_min + 0.99 * range;
-        }
+        WindData::WindClimate c;
+        double vmin = wind_min;
+        double vmax = wind_max;
+        if (vmax <= vmin) vmax = vmin + 0.1;
+        double range = vmax - vmin;
+        char loc_buf[64];
+        std::snprintf(loc_buf, sizeof(loc_buf), "Uniform %.1f-%.1f m/s", vmin, vmax);
+        c.location       = loc_buf;
+        c.region         = "User-defined";
+        c.uniform        = true;
+        c.v_min          = vmin;
+        c.v_max          = vmax;
+        c.mean_speed_ms  = (vmin + vmax) / 2.0;
+        c.percentile_50  = vmin + 0.50 * range;
+        c.percentile_75  = vmin + 0.75 * range;
+        c.percentile_90  = vmin + 0.90 * range;
+        c.percentile_95  = vmin + 0.95 * range;
+        c.percentile_99  = vmin + 0.99 * range;
+        c.weibull_k = 2.0;
+        c.weibull_c = 6.5;
+        c.standard       = "User-defined";
+        c.description    = "Uniform distribution";
         return c;
     }
 
@@ -156,7 +163,7 @@ struct AppState {
         if (static_cast<size_t>(material_index) < MATERIALS.size() - 1) {
             member.material = MATERIALS[material_index];
         } else {
-            member.material = {"Custom", custom_E_GPa, custom_rho};
+            member.material = {"Custom", custom_E_GPa, custom_rho, custom_yield_MPa};
         }
         member.D_mm          = D_mm;
         member.t_mm          = t_mm;
@@ -174,7 +181,7 @@ struct AppState {
             warnings.push_back(WindData::assess_risk(
                 mode1.V_critical_ms,
                 mode1.distribution.max_stress_MPa,
-                member.material.name == "A36 Steel" ? 250.0 : 345.0,
+                member.material.yield_MPa,
                 member.L_m, member.D_mm, location));
         }
     }
@@ -189,14 +196,13 @@ static HWND g_hwnd = nullptr;
 
 // Input controls
 static HWND g_hMaterialCombo = nullptr;
-static HWND g_hLocationCombo = nullptr;
 static HWND g_hDEdit = nullptr, g_hTEdit = nullptr, g_hLEdit = nullptr;
 static HWND g_hDampEdit = nullptr, g_hAxialEdit = nullptr;
-static HWND g_hVminEdit = nullptr, g_hVmaxEdit = nullptr;
 static HWND g_hCustomEEdit = nullptr, g_hCustomRhoEdit = nullptr;
+static HWND g_hWindMinEdit = nullptr, g_hWindMaxEdit = nullptr;
 static HWND g_hUDLRadio = nullptr, g_hMomentRadio = nullptr, g_hStressRadio = nullptr;
 static HWND g_hUncertaintyCheck = nullptr;
-static HWND g_hSaveButton = nullptr, g_hQuitButton = nullptr;
+static HWND g_hSaveButton = nullptr, g_hQuitButton = nullptr, g_hHelpButton = nullptr;
 static HWND g_hInfoText = nullptr;
 static HWND g_hStatusText = nullptr;
 
@@ -207,7 +213,6 @@ static HFONT g_hFontSmall = nullptr, g_hFontTitle = nullptr;
 // Custom-drawn region rectangles (recomputed on resize / scroll, in client coords)
 static RECT g_rectModes   = {};
 static RECT g_rectLegend  = {};
-static RECT g_rectWind    = {};
 static RECT g_rectWarning = {};
 
 // Vertical scroll state
@@ -237,17 +242,17 @@ enum {
     ID_LEDIT    = 1004,
     ID_DAMPEDIT = 1005,
     ID_AXIALEDIT= 1006,
-    ID_LOCATION = 1007,
-    ID_VMINEDIT = 1008,
-    ID_VMAXEDIT = 1009,
     ID_CUSTOM_E = 1010,
     ID_CUSTOM_RHO = 1011,
+    ID_WINDMIN  = 1012,
+    ID_WINDMAX  = 1013,
     ID_RADIO_UDL    = 2001,
     ID_RADIO_MOMENT = 2002,
     ID_RADIO_STRESS = 2003,
     ID_CHK_UNCERT   = 2004,
     ID_BTN_SAVE     = 3001,
     ID_BTN_QUIT     = 3002,
+    ID_BTN_HELP     = 3003,
 };
 
 // ============================================================================
@@ -478,7 +483,13 @@ static void draw_mode_shapes(HDC hdc, RECT r) {
         global_max = std::max(global_max, get_max_value(res.modes, g_state.active_color_var));
     }
 
-    // 6 BCs in 2 rows × 3 cols
+    // 5 BCs (skip Free-Free at index 3) in 2 rows x 3 cols
+    // Top row: indices 0,1,2; Bottom row: indices 4,5
+    std::vector<size_t> display_indices;
+    for (size_t i = 0; i < g_state.results.size() && i < 6; i++) {
+        if (i == 3) continue;  // skip Free-Free
+        display_indices.push_back(i);
+    }
     constexpr int n_cols = 3;
     constexpr int n_rows = 2;
     int cell_w = (r.right - r.left - 4) / n_cols;
@@ -486,9 +497,10 @@ static void draw_mode_shapes(HDC hdc, RECT r) {
 
     SetBkMode(hdc, TRANSPARENT);
 
-    for (size_t i = 0; i < g_state.results.size() && i < 6; i++) {
-        int col = (int)i % n_cols;
-        int row = (int)i / n_cols;
+    for (size_t di = 0; di < display_indices.size(); di++) {
+        size_t i = display_indices[di];
+        int col = (int)di % n_cols;
+        int row = (int)di / n_cols;
         RECT cell;
         cell.left   = r.left + 2 + col * cell_w;
         cell.top    = r.top  + 2 + row * cell_h;
@@ -573,9 +585,14 @@ static void draw_mode_shapes(HDC hdc, RECT r) {
 
         for (const auto& m : result.modes) {
             char buf[256];
+            char ord[16];
+            if (m.mode_number == 1) std::snprintf(ord, sizeof(ord), "1st");
+            else if (m.mode_number == 2) std::snprintf(ord, sizeof(ord), "2nd");
+            else if (m.mode_number == 3) std::snprintf(ord, sizeof(ord), "3rd");
+            else std::snprintf(ord, sizeof(ord), "%dth", m.mode_number);
             std::snprintf(buf, sizeof(buf),
-                "M%d  f=%.2f Hz  V=%.2f m/s",
-                m.mode_number, m.freq_hz, m.V_critical_ms);
+                "%s Mode  f=%.2f Hz  V=%.2f m/s",
+                ord, m.freq_hz, m.V_critical_ms);
             std::wstring l1 = to_wide(buf);
             TextOutW(hdc, cell.left + 8, text_y, l1.c_str(), (int)l1.size());
             text_y += line_h;
@@ -894,8 +911,9 @@ static void draw_warning_banner(HDC hdc, RECT r) {
     int x = r.left + 6;
     int avail_w = r.right - r.left - 12;
 
-    // One line per BC
+    // One line per BC (skip Free-Free at index 3)
     for (size_t i = 0; i < g_state.warnings.size() && i < g_state.results.size(); i++) {
+        if (i == 3) continue;  // skip Free-Free
         if (y + row_h > r.bottom) break;   // clip if panel too small
 
         const auto& w   = g_state.warnings[i];
@@ -951,9 +969,7 @@ static void LayoutWindow(int width, int height) {
     int modes_h    = 350;
     int legend_vy  = modes_vy + modes_h + MARGIN;
     int legend_h   = 58;
-    int wind_vy    = legend_vy + legend_h + MARGIN;
-    int wind_h     = 200;
-    int warn_vy    = wind_vy + wind_h + MARGIN;
+    int warn_vy    = legend_vy + legend_h + MARGIN;
     int warn_h     = 100;
     int btn_vy     = warn_vy + warn_h + MARGIN;
     int btn_h      = 28;
@@ -986,7 +1002,7 @@ static void LayoutWindow(int width, int height) {
     int dy = -g_scroll_y;
 
     // Reposition every tracked input-row child control with the scroll offset.
-    HDWP hdwp = BeginDeferWindowPos((int)g_pos_ctrls.size() + 4);
+    HDWP hdwp = BeginDeferWindowPos((int)g_pos_ctrls.size() + 5);
     for (const auto& p : g_pos_ctrls) {
         if (!p.h) continue;
         hdwp = DeferWindowPos(hdwp, p.h, nullptr,
@@ -996,6 +1012,10 @@ static void LayoutWindow(int width, int height) {
 
     // Bottom row: width-relative x, virtual y from layout above.
     int btn_w = 150;
+    int help_w = 30;
+    hdwp = DeferWindowPos(hdwp, g_hHelpButton, nullptr,
+        width - 2 * btn_w - 2 * MARGIN - help_w - MARGIN, btn_vy + dy, help_w, btn_h,
+        SWP_NOZORDER | SWP_NOACTIVATE);
     hdwp = DeferWindowPos(hdwp, g_hSaveButton, nullptr,
         width - 2 * btn_w - 2 * MARGIN, btn_vy + dy, btn_w, btn_h,
         SWP_NOZORDER | SWP_NOACTIVATE);
@@ -1003,14 +1023,13 @@ static void LayoutWindow(int width, int height) {
         width - 1 * btn_w - 1 * MARGIN, btn_vy + dy, btn_w, btn_h,
         SWP_NOZORDER | SWP_NOACTIVATE);
     hdwp = DeferWindowPos(hdwp, g_hStatusText, nullptr,
-        MARGIN, btn_vy + dy + 6, width - 2 * btn_w - 3 * MARGIN, 18,
+        MARGIN, btn_vy + dy + 6, width - 2 * btn_w - help_w - 4 * MARGIN, 18,
         SWP_NOZORDER | SWP_NOACTIVATE);
     EndDeferWindowPos(hdwp);
 
     // Custom-draw rects in CLIENT coordinates (virtual y + dy).
     g_rectModes   = { MARGIN, modes_vy  + dy, width - MARGIN, modes_vy  + modes_h  + dy };
     g_rectLegend  = { MARGIN, legend_vy + dy, width - MARGIN, legend_vy + legend_h + dy };
-    g_rectWind    = { MARGIN, wind_vy   + dy, width - MARGIN, wind_vy   + wind_h   + dy };
     g_rectWarning = { MARGIN, warn_vy   + dy, width - MARGIN, warn_vy   + warn_h   + dy };
 }
 
@@ -1087,11 +1106,8 @@ static void CreateControls(HWND hwnd) {
     label(L"Damping (zeta):", col2_x, y + 4,           LABEL_W);
     g_hDampEdit = edit(L"0.010", col2_x + LABEL_W, y, EDIT_W, ID_DAMPEDIT);
 
-    label(L"Axial F (kN):",   col2_x, y + 1*ROW_H + 4, LABEL_W);
+    label(L"Axial kN (+tens):",col2_x, y + 1*ROW_H + 4, LABEL_W);
     g_hAxialEdit = edit(L"0.0", col2_x + LABEL_W, y + 1*ROW_H, EDIT_W, ID_AXIALEDIT);
-
-    label(L"Location:",       col2_x, y + 2*ROW_H + 4, LABEL_W);
-    g_hLocationCombo = combo(col2_x + LABEL_W, y + 2*ROW_H, EDIT_W + 100, ID_LOCATION);
 
     // ----- Column 3: Calculated properties -----
     int col3_x = col2_x + LABEL_W + EDIT_W + 130;
@@ -1117,23 +1133,23 @@ static void CreateControls(HWND hwnd) {
         col4_x + 100, y + 1*ROW_H, 160, 22, ID_CHK_UNCERT, BS_AUTOCHECKBOX);
     SendMessage(g_hUncertaintyCheck, BM_SETCHECK, BST_CHECKED, 0);
 
-    // ----- Row 4: wind range (only for Custom Uniform location) -----
+    // ----- Row 4: custom material E and density (only for Custom material) -----
     int row4_y = y + 4*ROW_H;
-    label(L"Wind range (Custom Uniform only):", col1_x, row4_y + 4, 220);
-    g_hVminEdit = edit(L"0.0",  col1_x + 230, row4_y, 60, ID_VMINEDIT);
-    label(L"to", col1_x + 295, row4_y + 4, 16);
-    g_hVmaxEdit = edit(L"25.0", col1_x + 315, row4_y, 60, ID_VMAXEDIT);
-    label(L"m/s", col1_x + 380, row4_y + 4, 30);
+    label(L"Custom material:", col1_x, row4_y + 4, 110);
+    label(L"E (GPa):", col1_x + 115, row4_y + 4, 55);
+    g_hCustomEEdit   = edit(L"200.0", col1_x + 172, row4_y, 60, ID_CUSTOM_E);
+    label(L"Density (kg/m3):", col1_x + 245, row4_y + 4, 105);
+    g_hCustomRhoEdit = edit(L"7850", col1_x + 355, row4_y, 60, ID_CUSTOM_RHO);
 
-    // ----- Row 5: custom material E and density (only for Custom material) -----
+    // ----- Row 5: wind speed range (uniform distribution) -----
     int row5_y = y + 5*ROW_H;
-    label(L"Custom material:", col1_x, row5_y + 4, 110);
-    label(L"E (GPa):", col1_x + 115, row5_y + 4, 55);
-    g_hCustomEEdit   = edit(L"200.0", col1_x + 172, row5_y, 60, ID_CUSTOM_E);
-    label(L"Density (kg/m3):", col1_x + 245, row5_y + 4, 105);
-    g_hCustomRhoEdit = edit(L"7850", col1_x + 355, row5_y, 60, ID_CUSTOM_RHO);
+    label(L"Wind range (m/s):", col1_x, row5_y + 4, 110);
+    g_hWindMinEdit = edit(L"0.0",  col1_x + 115, row5_y, 60, ID_WINDMIN);
+    label(L"to", col1_x + 180, row5_y + 4, 16);
+    g_hWindMaxEdit = edit(L"20.0", col1_x + 200, row5_y, 60, ID_WINDMAX);
 
     // ----- Bottom row buttons (positioned later by LayoutWindow) -----
+    g_hHelpButton = button(L"?",               0, 0,  30, 28, ID_BTN_HELP);
     g_hSaveButton = button(L"Print Report...", 0, 0, 150, 28, ID_BTN_SAVE);
     g_hQuitButton = button(L"Quit",            0, 0, 150, 28, ID_BTN_QUIT);
 
@@ -1148,22 +1164,16 @@ static void CreateControls(HWND hwnd) {
     }
     SendMessage(g_hMaterialCombo, CB_SETCURSEL, g_state.material_index, 0);
 
-    for (const auto& loc : WindData::PORT_CLIMATES) {
-        SendMessageW(g_hLocationCombo, CB_ADDSTRING, 0,
-                     (LPARAM)to_wide(loc.location).c_str());
-    }
-    SendMessage(g_hLocationCombo, CB_SETCURSEL, g_state.location_index, 0);
-
     // Sync edit fields with initial state
     set_edit_double(g_hDEdit,     g_state.D_mm,           1);
     set_edit_double(g_hTEdit,     g_state.t_mm,           2);
     set_edit_double(g_hLEdit,     g_state.L_m,            2);
     set_edit_double(g_hDampEdit,  g_state.damping,        4);
     set_edit_double(g_hAxialEdit, g_state.axial_force_kN, 1);
-    set_edit_double(g_hVminEdit,  g_state.custom_wind_min, 1);
-    set_edit_double(g_hVmaxEdit,  g_state.custom_wind_max, 1);
     set_edit_double(g_hCustomEEdit,   g_state.custom_E_GPa, 1);
     set_edit_double(g_hCustomRhoEdit, g_state.custom_rho, 0);
+    set_edit_double(g_hWindMinEdit,   g_state.wind_min, 1);
+    set_edit_double(g_hWindMaxEdit,   g_state.wind_max, 1);
 
     // Apply font to every child (labels, edits, combos, buttons, statics)
     EnumChildWindows(hwnd, [](HWND h, LPARAM lp) -> BOOL {
@@ -1178,11 +1188,6 @@ static void CreateControls(HWND hwnd) {
 
 // Enable / disable conditional fields based on current selections.
 static void UpdateConditionalFields() {
-    // Wind range: only active for Custom Uniform location
-    bool wind_en = g_state.current_climate().uniform;
-    if (g_hVminEdit) EnableWindow(g_hVminEdit, wind_en);
-    if (g_hVmaxEdit) EnableWindow(g_hVmaxEdit, wind_en);
-
     // Custom material E / density: only active when material = "Custom"
     bool mat_en = (static_cast<size_t>(g_state.material_index) >= MATERIALS.size() - 1);
     if (g_hCustomEEdit)   EnableWindow(g_hCustomEEdit,   mat_en);
@@ -1209,10 +1214,10 @@ static void RefreshState() {
     g_state.L_m             = parse_double(g_hLEdit,     g_state.L_m);
     g_state.damping         = parse_double(g_hDampEdit,  g_state.damping);
     g_state.axial_force_kN  = parse_double(g_hAxialEdit, g_state.axial_force_kN);
-    g_state.custom_wind_min = parse_double(g_hVminEdit,  g_state.custom_wind_min);
-    g_state.custom_wind_max = parse_double(g_hVmaxEdit,  g_state.custom_wind_max);
     g_state.custom_E_GPa   = parse_double(g_hCustomEEdit,   g_state.custom_E_GPa);
     g_state.custom_rho     = parse_double(g_hCustomRhoEdit,  g_state.custom_rho);
+    g_state.wind_min       = parse_double(g_hWindMinEdit,    g_state.wind_min);
+    g_state.wind_max       = parse_double(g_hWindMaxEdit,    g_state.wind_max);
 
     // Sanity clamps so we never crash the physics
     if (g_state.D_mm < 1.0)               g_state.D_mm = 1.0;
@@ -1221,16 +1226,14 @@ static void RefreshState() {
     if (g_state.L_m  < 0.1)               g_state.L_m  = 0.1;
     if (g_state.damping < 0.0001)         g_state.damping = 0.0001;
     if (g_state.damping > 0.5)            g_state.damping = 0.5;
-    if (g_state.custom_wind_min < 0.0)    g_state.custom_wind_min = 0.0;
-    if (g_state.custom_wind_max <= g_state.custom_wind_min)
-        g_state.custom_wind_max = g_state.custom_wind_min + 0.1;
     if (g_state.custom_E_GPa < 0.1)     g_state.custom_E_GPa = 0.1;
     if (g_state.custom_rho   < 1.0)     g_state.custom_rho   = 1.0;
+    if (g_state.wind_min < 0.0)          g_state.wind_min = 0.0;
+    if (g_state.wind_max <= g_state.wind_min)
+        g_state.wind_max = g_state.wind_min + 0.1;
 
     g_state.material_index = (int)SendMessage(g_hMaterialCombo, CB_GETCURSEL, 0, 0);
-    g_state.location_index = (int)SendMessage(g_hLocationCombo, CB_GETCURSEL, 0, 0);
     if (g_state.material_index < 0) g_state.material_index = 0;
-    if (g_state.location_index < 0) g_state.location_index = 0;
 
     g_state.update();
     UpdateInfoText();
@@ -1239,7 +1242,6 @@ static void RefreshState() {
     // Repaint custom-drawn regions only
     InvalidateRect(g_hwnd, &g_rectModes,   FALSE);
     InvalidateRect(g_hwnd, &g_rectLegend,  FALSE);
-    InvalidateRect(g_hwnd, &g_rectWind,    FALSE);
     InvalidateRect(g_hwnd, &g_rectWarning, FALSE);
 }
 
@@ -2113,13 +2115,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int id   = LOWORD(wp);
             int code = HIWORD(wp);
 
-            if (id >= ID_DEDIT && id <= ID_CUSTOM_RHO
-                && id != ID_LOCATION
+            if (id >= ID_DEDIT && id <= ID_WINDMAX
                 && code == EN_CHANGE) {
                 RefreshState();
                 return 0;
             }
-            if ((id == ID_MATERIAL || id == ID_LOCATION) && code == CBN_SELCHANGE) {
+            if (id == ID_MATERIAL && code == CBN_SELCHANGE) {
                 RefreshState();
                 return 0;
             }
@@ -2195,6 +2196,39 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     DestroyWindow(hwnd);
                     return 0;
                 }
+                if (id == ID_BTN_HELP) {
+                    MessageBoxW(hwnd,
+                        L"Vortex Shedding Calculator\r\n"
+                        L"\r\n"
+                        L"Analyzes vortex-induced vibration in HSS round members\r\n"
+                        L"\r\n"
+                        L"INPUTS\r\n"
+                        L"  Material    — select from list or choose Custom to enter E and density\r\n"
+                        L"  Diameter    — outer diameter of the HSS round (mm)\r\n"
+                        L"  Thickness   — wall thickness (mm)\r\n"
+                        L"  Length      — unsupported span between supports (m)\r\n"
+                        L"  Damping     — structural damping ratio, steel typical 0.005 (bare) to 0.02 (bolted/with attachments)\r\n"
+                        L"  Axial Force — positive = tension, negative = compression (kN)\r\n"
+                        L"\r\n"
+                        L"OUTPUTS\r\n"
+                        L"  Five boundary conditions are analyzed for 1st and 2nd mode.\r\n"
+                        L"  Each panel shows the mode shape colored by the active variable\r\n"
+                        L"  (UDL, Moment, or Stress — switch with the radio buttons).\r\n"
+                        L"\r\n"
+                        L"  The warning panel shows risk level per BC based on a uniform\r\n"
+                        L"  wind distribution initially set from 0 to 20 m/s (use 63m/s for storm conditions).\r\n"
+                        L"\r\n"
+                        L"CONTROLS\r\n"
+                        L"  Tab         — cycle between input fields\r\n"
+                        L"  Mouse wheel — scroll the window\r\n"
+                        L"  PgUp/PgDn   — scroll by page\r\n"
+                        L"  Print Report — select sections and export to .docx or .txt\r\n"
+                        L"\r\n"
+                        L"  All fields recalculate live as you type.\r\n",
+                        L"Help — Torsor v0.2",
+                        MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
             }
             return 0;
         }
@@ -2231,7 +2265,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             draw_mode_shapes      (mem, g_rectModes);
             draw_color_legend     (mem, g_rectLegend);
-            draw_wind_distribution(mem, g_rectWind);
             draw_warning_banner   (mem, g_rectWarning);
 
             BitBlt(hdc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
