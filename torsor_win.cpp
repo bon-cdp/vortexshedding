@@ -305,6 +305,10 @@ static void set_edit_double(HWND hEdit, double v, int precision) {
 
 // User selections from the Print Report dialog. Each section can be toggled
 // independently; the .docx and .txt writers honor these flags.
+// Indices of BCs that are active in the UI (skip Free-Free=3, Hinged-Free=5)
+static const size_t VISIBLE_BC_INDICES[] = {0, 1, 2, 4};
+static const int    NUM_VISIBLE_BCS      = 4;
+
 struct PrintOptions {
     bool include_logo           = true;
     bool include_inputs         = true;
@@ -315,11 +319,17 @@ struct PrintOptions {
     bool include_recommendations= true;
     bool include_mode_plots     = true;
     bool include_wind_plot      = true;
+    // Per-BC selection for reports (indexed by BOUNDARY_CONDITIONS index 0-5)
+    bool include_bc[6] = {true, true, true, false, true, false};
     int  format = 0;  // 0 = .docx, 1 = .txt
+
+    bool is_bc_included(size_t bc_idx) const {
+        return bc_idx < 6 && include_bc[bc_idx];
+    }
 };
 
 // Forward declarations of plot drawing functions used by the report writers.
-static void draw_mode_shapes      (HDC hdc, RECT r);
+static void draw_mode_shapes      (HDC hdc, RECT r, const bool* bc_filter = nullptr);
 static void draw_color_legend     (HDC hdc, RECT r);
 static void draw_wind_distribution(HDC hdc, RECT r);
 
@@ -370,10 +380,12 @@ static bool save_text_report(const std::string& filename, const PrintOptions& op
     }
 
     if (opt.include_results_table) {
-        out << "DETAILED RESULTS - ALL BOUNDARY CONDITIONS\n";
-        out << "------------------------------------------\n";
+        out << "DETAILED RESULTS - SELECTED BOUNDARY CONDITIONS\n";
+        out << "------------------------------------------------\n";
         out << "  BC                          Mode   f(Hz)    V(m/s)   F(kN)    sigma(MPa)\n";
-        for (const auto& bc_result : g_state.results) {
+        for (size_t i = 0; i < g_state.results.size(); i++) {
+            if (!opt.is_bc_included(i)) continue;
+            const auto& bc_result = g_state.results[i];
             for (const auto& mode : bc_result.modes) {
                 char line[256];
                 std::snprintf(line, sizeof(line),
@@ -395,6 +407,7 @@ static bool save_text_report(const std::string& filename, const PrintOptions& op
         out << "----------------------------------------------\n";
         out << "  BC                          Mode  sigma_min   sigma_nom   sigma_max  (MPa)\n";
         for (size_t i = 0; i < g_state.results.size(); i++) {
+            if (!opt.is_bc_included(i)) continue;
             const auto& bc_result = g_state.results[i];
             for (const auto& mode_res : bc_result.modes) {
                 auto rng = VortexPhysics::analyze_mode_with_damping_range(
@@ -420,6 +433,7 @@ static bool save_text_report(const std::string& filename, const PrintOptions& op
         out << "RISK ASSESSMENT\n";
         out << "---------------\n";
         for (size_t i = 0; i < g_state.warnings.size() && i < g_state.results.size(); i++) {
+            if (!opt.is_bc_included(i)) continue;
             const auto& w = g_state.warnings[i];
             out << "  " << g_state.results[i].bc_name << "\n";
             out << "    [" << w.level_name << "] " << w.message << "\n";
@@ -434,6 +448,7 @@ static bool save_text_report(const std::string& filename, const PrintOptions& op
         WindData::WarningLevel worst = WindData::SAFE;
         size_t worst_idx = 0;
         for (size_t i = 0; i < g_state.warnings.size(); i++) {
+            if (!opt.is_bc_included(i)) continue;
             if (g_state.warnings[i].level > worst) {
                 worst = g_state.warnings[i].level;
                 worst_idx = i;
@@ -461,7 +476,7 @@ static bool save_text_report(const std::string& filename, const PrintOptions& op
 // CUSTOM DRAWING — mode shapes panel
 // ============================================================================
 
-static void draw_mode_shapes(HDC hdc, RECT r) {
+static void draw_mode_shapes(HDC hdc, RECT r, const bool* bc_filter) {
     HBRUSH bg = CreateSolidBrush(RGB(252, 252, 254));
     FillRect(hdc, &r, bg);
     DeleteObject(bg);
@@ -483,15 +498,23 @@ static void draw_mode_shapes(HDC hdc, RECT r) {
         global_max = std::max(global_max, get_max_value(res.modes, g_state.active_color_var));
     }
 
-    // 5 BCs (skip Free-Free at index 3) in 2 rows x 3 cols
-    // Top row: indices 0,1,2; Bottom row: indices 4,5
+    // Build list of BCs to display.
+    // If bc_filter is provided (report mode), use it; otherwise show all visible BCs.
     std::vector<size_t> display_indices;
     for (size_t i = 0; i < g_state.results.size() && i < 6; i++) {
-        if (i == 3) continue;  // skip Free-Free
+        if (i == 3 || i == 5) continue;  // always skip Free-Free and Hinged-Free
+        if (bc_filter && !bc_filter[i]) continue;  // report filter
         display_indices.push_back(i);
     }
-    constexpr int n_cols = 3;
-    constexpr int n_rows = 2;
+    if (display_indices.empty()) return;
+
+    // Adapt grid layout to number of selected BCs
+    int n_cols, n_rows;
+    int count = (int)display_indices.size();
+    if (count <= 1)      { n_cols = 1; n_rows = 1; }
+    else if (count <= 2) { n_cols = 2; n_rows = 1; }
+    else if (count <= 4) { n_cols = 2; n_rows = 2; }
+    else                 { n_cols = 3; n_rows = 2; }
     int cell_w = (r.right - r.left - 4) / n_cols;
     int cell_h = (r.bottom - r.top - 4) / n_rows;
 
@@ -823,6 +846,7 @@ static void draw_wind_distribution(HDC hdc, RECT r) {
     // Critical wind speeds (per BC) — solid magenta lines
     if (!g_state.results.empty()) {
         for (size_t i = 0; i < g_state.results.size(); i++) {
+            if (i == 3 || i == 5) continue;  // skip Free-Free and Hinged-Free
             const auto& bc_result = g_state.results[i];
             if (bc_result.modes.empty()) continue;
             double V_crit = bc_result.modes[0].V_critical_ms;
@@ -911,13 +935,11 @@ static void draw_warning_banner(HDC hdc, RECT r) {
     int x = r.left + 6;
     int avail_w = r.right - r.left - 12;
 
-    // One line per BC (skip Free-Free at index 3)
-    for (size_t i = 0; i < g_state.warnings.size() && i < g_state.results.size(); i++) {
-        if (i == 3) continue;  // skip Free-Free
-        if (y + row_h > r.bottom) break;   // clip if panel too small
-
-        const auto& w   = g_state.warnings[i];
-        const auto& bc  = g_state.results[i];
+    // One line per BC per mode (skip Free-Free at index 3, Hinged-Free at index 5)
+    const auto location = g_state.current_climate();
+    for (size_t i = 0; i < g_state.results.size(); i++) {
+        if (i == 3 || i == 5) continue;  // skip Free-Free and Hinged-Free
+        const auto& bc = g_state.results[i];
 
         // Shorten BC name
         std::string bc_short = bc.bc_name;
@@ -925,36 +947,46 @@ static void draw_warning_banner(HDC hdc, RECT r) {
         else if (bc_short.find("Fixed-Hinged") != std::string::npos) bc_short = "Fix-Hng";
         else if (bc_short.find("Hinged-Hinged") != std::string::npos)bc_short = "Hng-Hng";
         else if (bc_short.find("Fixed-Free") != std::string::npos)   bc_short = "Cantilev";
-        else if (bc_short.find("Hinged-Free") != std::string::npos)  bc_short = "Hng-Free";
         else if (bc_short.find("Free-Free") != std::string::npos)    bc_short = "Free-Free";
 
-        // Small colored tag for the level
-        COLORREF tag_bg, tag_fg;
-        warning_level_colors(w.level, tag_bg, tag_fg);
+        for (const auto& mode : bc.modes) {
+            if (y + row_h > r.bottom) break;
 
-        int tag_w = 80;
-        RECT tag_r = { x, y, x + tag_w, y + row_h };
-        HBRUSH tb = CreateSolidBrush(tag_bg);
-        FillRect(hdc, &tag_r, tb);
-        DeleteObject(tb);
+            auto w = WindData::assess_risk(
+                mode.V_critical_ms,
+                mode.distribution.max_stress_MPa,
+                g_state.member.material.yield_MPa,
+                g_state.member.L_m, g_state.member.D_mm, location);
 
-        SetTextColor(hdc, tag_fg);
-        std::wstring lvl_w = to_wide(w.level_name);
-        DrawTextW(hdc, lvl_w.c_str(), -1, &tag_r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            // Small colored tag for the level
+            COLORREF tag_bg, tag_fg;
+            warning_level_colors(w.level, tag_bg, tag_fg);
 
-        // BC name + details
-        SetTextColor(hdc, RGB(40, 40, 40));
-        char line[256];
-        std::snprintf(line, sizeof(line),
-            "  %-10s  V=%.2f m/s  wind=%.1f%%  stress=%.1f%% yield",
-            bc_short.c_str(),
-            bc.modes.empty() ? 0.0 : bc.modes[0].V_critical_ms,
-            w.wind_percentile,
-            w.stress_ratio * 100.0);
-        std::wstring lw = to_wide(line);
-        TextOutW(hdc, x + tag_w + 4, y, lw.c_str(), (int)lw.size());
+            int tag_w = 80;
+            RECT tag_r = { x, y, x + tag_w, y + row_h };
+            HBRUSH tb = CreateSolidBrush(tag_bg);
+            FillRect(hdc, &tag_r, tb);
+            DeleteObject(tb);
 
-        y += row_h;
+            SetTextColor(hdc, tag_fg);
+            std::wstring lvl_w = to_wide(w.level_name);
+            DrawTextW(hdc, lvl_w.c_str(), -1, &tag_r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            // BC name + mode + details
+            SetTextColor(hdc, RGB(40, 40, 40));
+            char line[256];
+            std::snprintf(line, sizeof(line),
+                "  %-10s M%d  V=%.2f m/s  wind=%.1f%%  stress=%.1f%% yield",
+                bc_short.c_str(),
+                mode.mode_number,
+                mode.V_critical_ms,
+                w.wind_percentile,
+                w.stress_ratio * 100.0);
+            std::wstring lw = to_wide(line);
+            TextOutW(hdc, x + tag_w + 4, y, lw.c_str(), (int)lw.size());
+
+            y += row_h;
+        }
     }
 }
 
@@ -970,7 +1002,7 @@ static void LayoutWindow(int width, int height) {
     int legend_vy  = modes_vy + modes_h + MARGIN;
     int legend_h   = 58;
     int warn_vy    = legend_vy + legend_h + MARGIN;
-    int warn_h     = 100;
+    int warn_h     = 135;
     int btn_vy     = warn_vy + warn_h + MARGIN;
     int btn_h      = 28;
     g_content_h    = btn_vy + btn_h + MARGIN;
@@ -1601,8 +1633,11 @@ static bool save_docx_report(const std::string& filename, const PrintOptions& op
     }
 
     if (opt.include_mode_plots) {
+        // Capture the BC filter into the lambda so only selected BCs render
+        bool bc_filt[6];
+        for (int i = 0; i < 6; i++) bc_filt[i] = opt.include_bc[i];
         auto png = render_panel_png(900, 360,
-            [](HDC hdc, RECT r) { draw_mode_shapes(hdc, r); });
+            [bc_filt](HDC hdc, RECT r) { draw_mode_shapes(hdc, r, bc_filt); });
         if (!png.empty()) {
             DocxImage img;
             img.filename  = "image" + std::to_string(images.size() + 1) + ".png";
@@ -1686,11 +1721,13 @@ static bool save_docx_report(const std::string& filename, const PrintOptions& op
     }
 
     if (opt.include_results_table) {
-        body += ooxml_heading("Detailed Results — All Boundary Conditions", 2);
+        body += ooxml_heading("Detailed Results — Selected Boundary Conditions", 2);
         std::vector<std::vector<std::string>> rows;
         rows.push_back({"Boundary condition", "Mode", "f (Hz)",
                         "V_crit (m/s)", "F (kN)", "sigma_max (MPa)"});
-        for (const auto& bc_result : g_state.results) {
+        for (size_t i = 0; i < g_state.results.size(); i++) {
+            if (!opt.is_bc_included(i)) continue;
+            const auto& bc_result = g_state.results[i];
             for (const auto& m : bc_result.modes) {
                 rows.push_back({
                     bc_result.bc_name,
@@ -1711,6 +1748,7 @@ static bool save_docx_report(const std::string& filename, const PrintOptions& op
         rows.push_back({"Boundary condition", "Mode",
                         "sigma_min (MPa)", "sigma_nom (MPa)", "sigma_max (MPa)"});
         for (size_t i = 0; i < g_state.results.size(); i++) {
+            if (!opt.is_bc_included(i)) continue;
             const auto& bc_result = g_state.results[i];
             for (const auto& mode_res : bc_result.modes) {
                 auto rng = VortexPhysics::analyze_mode_with_damping_range(
@@ -1733,6 +1771,7 @@ static bool save_docx_report(const std::string& filename, const PrintOptions& op
         std::vector<std::vector<std::string>> rows;
         rows.push_back({"Boundary condition", "Level", "Wind percentile", "Stress / yield"});
         for (size_t i = 0; i < g_state.warnings.size() && i < g_state.results.size(); i++) {
+            if (!opt.is_bc_included(i)) continue;
             const auto& w = g_state.warnings[i];
             rows.push_back({
                 g_state.results[i].bc_name,
@@ -1748,6 +1787,7 @@ static bool save_docx_report(const std::string& filename, const PrintOptions& op
         WindData::WarningLevel worst = WindData::SAFE;
         size_t worst_idx = 0;
         for (size_t i = 0; i < g_state.warnings.size(); i++) {
+            if (!opt.is_bc_included(i)) continue;
             if (g_state.warnings[i].level > worst) {
                 worst = g_state.warnings[i].level;
                 worst_idx = i;
@@ -1850,6 +1890,7 @@ static HWND g_print_dialog_hwnd = nullptr;
 static HWND g_dlg_chk_logo, g_dlg_chk_inputs, g_dlg_chk_calc;
 static HWND g_dlg_chk_results, g_dlg_chk_uncert, g_dlg_chk_risk, g_dlg_chk_recs;
 static HWND g_dlg_chk_modes, g_dlg_chk_wind;
+static HWND g_dlg_chk_bc[6] = {};  // per-BC checkboxes (only visible ones created)
 static HWND g_dlg_radio_docx, g_dlg_radio_txt;
 static HWND g_dlg_btn_ok, g_dlg_btn_cancel;
 
@@ -1910,6 +1951,26 @@ static LRESULT CALLBACK PrintDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             g_dlg_chk_wind    = mk_chk(L"Wind speed distribution plot (rendered as image)",
                                        x, y, 380, 20, g_print_options.include_wind_plot); y += gap + 8;
 
+            mk_label(L"Boundary conditions to include:", x, y, 360, 18); y += 22;
+            {
+                // BC names matching VISIBLE_BC_INDICES = {0, 1, 2, 4}
+                static const wchar_t* bc_labels[] = {
+                    L"Fixed-Free (Cantilever)",
+                    L"Hinged-Hinged (Simple)",
+                    L"Fixed-Fixed (Built-in)",
+                    nullptr,  // index 3 = Free-Free (hidden)
+                    L"Fixed-Hinged",
+                    nullptr,  // index 5 = Hinged-Free (hidden)
+                };
+                for (int vi = 0; vi < NUM_VISIBLE_BCS; vi++) {
+                    size_t bi = VISIBLE_BC_INDICES[vi];
+                    g_dlg_chk_bc[bi] = mk_chk(bc_labels[bi],
+                        x, y, 380, 20, g_print_options.include_bc[bi]);
+                    y += gap;
+                }
+            }
+            y += 8;
+
             mk_label(L"Output format:", x, y, 200, 18); y += 22;
             g_dlg_radio_docx = mk_radio(L"Word document (.docx)",
                                         x, y, 240, 20, WS_GROUP); y += 22;
@@ -1958,6 +2019,12 @@ static LRESULT CALLBACK PrintDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
                     SendMessage(g_dlg_chk_modes, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 g_print_options.include_wind_plot =
                     SendMessage(g_dlg_chk_wind, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                // Read per-BC checkboxes
+                for (int vi = 0; vi < NUM_VISIBLE_BCS; vi++) {
+                    size_t bi = VISIBLE_BC_INDICES[vi];
+                    g_print_options.include_bc[bi] =
+                        SendMessage(g_dlg_chk_bc[bi], BM_GETCHECK, 0, 0) == BST_CHECKED;
+                }
                 g_print_options.format =
                     (SendMessage(g_dlg_radio_txt, BM_GETCHECK, 0, 0) == BST_CHECKED)
                         ? 1 : 0;
@@ -2000,7 +2067,7 @@ static bool show_print_dialog(HWND parent) {
     g_print_dialog_done = false;
     g_print_dialog_ok   = false;
 
-    int dlg_w = 460, dlg_h = 480;
+    int dlg_w = 460, dlg_h = 620;
     RECT pr;
     GetWindowRect(parent, &pr);
     int dlg_x = pr.left + ((pr.right - pr.left) - dlg_w) / 2;
